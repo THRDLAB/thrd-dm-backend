@@ -75,33 +75,44 @@ def _prepare_image(img: Image.Image) -> Image.Image:
 
 def _decode_pylibdmtx(img: Image.Image) -> List[Dict]:
     """Appelle pylibdmtx et renvoie une liste de dicts normalisés."""
-    # dmtx_decode attend une image PIL (mode 'L' ou 'RGB' ok)
-    results = dmtx_decode(img)
+    results_raw = dmtx_decode(img)
 
     out: List[Dict] = []
-    for r in results or []:
-        # r.data est un bytes; on tente utf-8 puis on nettoie
+    for r in results_raw or []:
+        # data -> str
         try:
             text = r.data.decode("utf-8", errors="ignore")
         except Exception:
             text = ""
 
-        # r.rect ~ {'left':..., 'top':..., 'width':..., 'height':...}
+        # bbox: gérer tous les cas (objet attrs / dict / tuple)
         bbox = None
-        if hasattr(r, "rect") and r.rect:
-            # Option simple : left, top, width, height
-            rect = r.rect
-            bbox = [rect.get("left"), rect.get("top"), rect.get("width"), rect.get("height")]
+        rect = getattr(r, "rect", None)
+        if rect:
+            try:
+                # cas objet avec attributs
+                bbox = [rect.left, rect.top, rect.width, rect.height]
+            except Exception:
+                try:
+                    # cas mapping/dict-like
+                    bbox = [rect["left"], rect["top"], rect["width"], rect["height"]]
+                except Exception:
+                    try:
+                        # cas tuple (left, top, width, height)
+                        bbox = [rect[0], rect[1], rect[2], rect[3]]
+                    except Exception:
+                        bbox = None
 
         out.append(
             {
                 "type": "DataMatrix",
                 "text": text,
                 "bbox": bbox,
-                "polygon": None,  # pylibdmtx ne renvoie pas de polygone détaillé
+                "polygon": None,
             }
         )
     return out
+
 
 
 def _decode_image_pipeline(img: Image.Image) -> List[Dict]:
@@ -206,3 +217,4 @@ def decode_url(
     )
 
     return {"ok": True, "found": len(results), "barcodes": results}
+
