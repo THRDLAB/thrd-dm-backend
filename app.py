@@ -12,6 +12,31 @@ def root():
 def health():
     return {"ok": True}
 
+# --- Lookup médicaments (CIP13) : imports légers stdlib-only ---
+import os
+from fastapi import HTTPException, Query
+from resolver import (
+    parse_datamatrix_to_cip13,
+    extract_conditionnement,
+    extract_dosage_from_compo,
+    fallback_dosage_from_text,
+)
+from index_builder import CipIndexManager
+
+# Config
+API_BASE_URL = os.getenv("API_BASE_URL", "https://medicaments-api.giygas.dev")
+CIP_INDEX_CACHE_PATH = os.getenv("CIP_INDEX_CACHE_PATH", "cip_index.json")
+
+# Manager d'index en mémoire + cache disque
+CIP_MGR = CipIndexManager(cache_path=CIP_INDEX_CACHE_PATH)
+
+@app.on_event("startup")
+def _build_index_on_boot():
+    # Boot rapide : charge le cache si présent, sinon construit l’index local depuis l’API
+    CIP_MGR.warm_start_or_build(base_url=API_BASE_URL)
+
+
+
 def _lazy_imports():
     """
     Importe à la demande les dépendances lourdes.
@@ -211,3 +236,36 @@ async def decode_file(file: UploadFile = File(...)):
         raise
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+@app.get("/lookup/cip/{cip13}")
+def lookup_cip(cip13: str):
+    """
+    Retourne les infos médicament à partir d'un CIP13.
+    """
+    item = CIP_MGR.get(cip13)
+    if not item:
+        raise HTTPException(status_code=404, detail=f"CIP13 {cip13} introuvable.")
+    cond = extract_conditionnement(item.get("libelle"))
+    dosage = extract_dosage_from_compo(item.get("composition")) or \
+             fallback_dosage_from_text(item.get("nom"), item.get("libelle"))
+    return {"ok": True, "data": {
+        "cip13": cip13,
+        "nom": item.get("nom"),
+        "forme": item.get("forme"),
+        "dosage": dosage,
+        "conditionnement": cond,
+        "libelle": item.get("libelle"),
+    }}
+
+
+@app.get("/lookup/from-dm")
+def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMatrix)")):
+    """
+    Extrait le CIP13 depuis la chaîne GS1 (AI01=GTIN 03400...) puis fait le lookup local.
+    """
+    cip13 = parse_datamatrix_to_cip13(gs1)
+    if not cip13:
+        raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
+    return lookup_cip(cip13)
+
+
