@@ -10,9 +10,9 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os, threading, time as _time
-import json
 from typing import Any, Dict
 from fastapi import Query
+import traceback, json, os
 
 # ==== Lookup / Index manager (stdlib only) ====
 from resolver import (
@@ -95,34 +95,34 @@ from fastapi import Query
 def admin_rebuild_index_throttled(
     pages: int = Query(5, ge=1, le=500, description="Nombre de pages BDPM à traiter dans CET appel")
 ):
-    """
-    Construit l'index par tranches rapides.
-    - `pages`: nb de pages BDPM à traiter pour cet appel (1–500).
-    """
-    from index_builder import build_cip_index_from_api, save_index_to_disk, merge_indexes
-    # override temporaire pour CET appel
-    os.environ["INDEX_PAGES_PER_RUN"] = str(pages)
+    try:
+        # (si tu n’as PAS modifié index_builder pour accepter pages_per_run,
+        # on ne passe rien ici : il lira INDEX_PAGES_PER_RUN depuis l'env)
+        # Si tu l’as modifié, dé-commente cette ligne et commente la suivante :
+        # tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=None, pages_per_run=pages)
+        tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=None)
 
-    tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=None)
-    added = len(tmp)
-    if added == 0:
-        return {"ok": True, "indexed": 0, "index_size": CIP_MGR.size, "note": "no new pages (or rate-limited)"}
+        added = len(tmp)
+        if added == 0:
+            return {"ok": True, "indexed": 0, "index_size": CIP_MGR.size, "note": "no new pages (or rate-limited)"}
 
-    existing = []
-    if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
-        try:
-            import json as _json
+        existing = []
+        if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
             with open(CIP_INDEX_CACHE_PATH, "r", encoding="utf-8") as f:
-                existing = _json.load(f)
-        except Exception:
-            existing = CIP_MGR._index or []
+                existing = json.load(f)
 
-    merged = merge_indexes(existing, tmp)
-    save_index_to_disk(merged, CIP_INDEX_CACHE_PATH)
-    CIP_MGR._index = merged
-    return {"ok": True, "indexed": added, "index_size": len(merged), "cache_path": CIP_INDEX_CACHE_PATH}
+        merged = merge_indexes(existing, tmp)
+        save_index_to_disk(merged, CIP_INDEX_CACHE_PATH)
+        CIP_MGR._index = merged
+        return {"ok": True, "indexed": added, "index_size": len(merged), "cache_path": CIP_INDEX_CACHE_PATH}
 
-# ==== Diag egress utiles (optionnels, mais pratiques) ====
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e), "trace": traceback.format_exc()}
+        )
+        
+# ==== Diag egress ====
 import socket, json
 from urllib.request import Request, urlopen
 
@@ -431,6 +431,7 @@ def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMat
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
+
 
 
 
