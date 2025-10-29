@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os, threading, time as _time
+import json
 from typing import Any, Dict
 
 # ==== Lookup / Index manager (stdlib only) ====
@@ -422,4 +423,5 @@ def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMat
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
+
 
