@@ -378,7 +378,7 @@ def admin_progress():
         return {"ok": False, "msg": "INDEX_PROGRESS_PATH not set"}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            js = _json.load(f)
+            js = json.load(f)
         return {"ok": True, "progress": js, "path": path}
     except Exception as e:
         return {"ok": False, "error": str(e), "path": path}
@@ -390,7 +390,7 @@ def admin_progress_reset(next_page: int = 1):
         raise HTTPException(status_code=400, detail="INDEX_PROGRESS_PATH not set")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        _json.dump({"next_page": int(next_page), "ts": _time.time()}, f)
+        json.dump({"next_page": int(next_page), "ts": _time.time()}, f)
     return {"ok": True, "path": path, "next_page": next_page}
 
 
@@ -423,5 +423,6 @@ def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMat
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
+
 
 
