@@ -36,19 +36,40 @@ CIP_INDEX_CACHE_PATH = os.getenv("CIP_INDEX_CACHE_PATH", "cip_index.json")
 
 CIP_MGR = CipIndexManager(cache_path=CIP_INDEX_CACHE_PATH)
 INDEX_READY = False  # indicateur simple
+_INDEX_LOCK = threading.Lock()
+
+
+def _ensure_index_ready():
+    """Garantit que l'index est chargé avant de répondre aux lookups."""
+    global INDEX_READY
+    if INDEX_READY and CIP_MGR.size > 0:
+        return
+
+    with _INDEX_LOCK:
+        if INDEX_READY and CIP_MGR.size > 0:
+            return
+        try:
+            CIP_MGR.warm_start_or_build(base_url=API_BASE_URL)
+        except Exception:
+            # on laisse le thread de fond réessayer; les endpoints remonteront 503
+            pass
+        finally:
+            INDEX_READY = (CIP_MGR.size > 0)
 
 def _build_index_job():
     """Construit/charge l'index en arrière-plan (boot non bloquant)."""
     global INDEX_READY
     try:
         # Warm-start depuis disque si possible, sinon build complet depuis l'API
-        CIP_MGR.warm_start_or_build(base_url=API_BASE_URL)
-        INDEX_READY = (CIP_MGR.size > 0)
+        with _INDEX_LOCK:
+            CIP_MGR.warm_start_or_build(base_url=API_BASE_URL)
+            INDEX_READY = (CIP_MGR.size > 0)
         # Refresh périodique
         while True:
             _time.sleep(12 * 3600)  # toutes les 12 h
             try:
-                CIP_MGR.refresh(base_url=API_BASE_URL)
+                with _INDEX_LOCK:
+                    CIP_MGR.refresh(base_url=API_BASE_URL)
             finally:
                 INDEX_READY = (CIP_MGR.size > 0)
     except Exception:
@@ -335,6 +356,8 @@ def decode_url(url: str = Query(..., description="URL publique d'une image (jpg/
 @app.get("/lookup/cip/{cip13}")
 def lookup_cip(cip13: str):
     if not INDEX_READY or CIP_MGR.size == 0:
+        _ensure_index_ready()
+    if not INDEX_READY or CIP_MGR.size == 0:
         raise HTTPException(status_code=503, detail="INDEX_NOT_READY")
     item = CIP_MGR.get(cip13)
     if not item:
@@ -353,6 +376,8 @@ def lookup_cip(cip13: str):
 
 @app.get("/lookup/from-dm")
 def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMatrix)")):
+    if not INDEX_READY or CIP_MGR.size == 0:
+        _ensure_index_ready()
     if not INDEX_READY or CIP_MGR.size == 0:
         raise HTTPException(status_code=503, detail="INDEX_NOT_READY")
     cip13 = parse_datamatrix_to_cip13(gs1)
