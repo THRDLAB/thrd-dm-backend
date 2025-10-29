@@ -106,21 +106,22 @@ def admin_rebuild_index_throttled(
         if added == 0:
             return {"ok": True, "indexed": 0, "index_size": CIP_MGR.size, "note": "no new pages (or rate-limited)"}
 
+       existing = []
+if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
+    try:
+        import json as json
+        with open(CIP_INDEX_CACHE_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        # On ne garde que les dicts avec cip13
+        if isinstance(raw, list):
+            existing = [x for x in raw if isinstance(x, dict) and "cip13" in x]
+        elif isinstance(raw, dict) and "cip13" in raw:
+            existing = [raw]
+        else:
+            existing = []
+    except Exception:
         existing = []
-        if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
-            with open(CIP_INDEX_CACHE_PATH, "r", encoding="utf-8") as f:
-                existing = json.load(f)
 
-        merged = merge_indexes(existing, tmp)
-        save_index_to_disk(merged, CIP_INDEX_CACHE_PATH)
-        CIP_MGR._index = merged
-        return {"ok": True, "indexed": added, "index_size": len(merged), "cache_path": CIP_INDEX_CACHE_PATH}
-
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": str(e), "trace": traceback.format_exc()}
-        )
         
 # ==== Diag egress ====
 import socket, json
@@ -401,6 +402,17 @@ def admin_progress_reset(next_page: int = 1):
         json.dump({"next_page": int(next_page), "ts": _time.time()}, f)
     return {"ok": True, "path": path, "next_page": next_page}
 
+@app.post("/admin/cache/reset")
+def admin_cache_reset():
+    try:
+        if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
+            os.remove(CIP_INDEX_CACHE_PATH)
+        # on vide l'index en mémoire
+        CIP_MGR._index = []
+        return {"ok": True, "deleted": CIP_INDEX_CACHE_PATH}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 # ==== Endpoints lookup (utilisent l’index local persistant) ====
 
@@ -431,6 +443,7 @@ def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMat
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
+
 
 
 
