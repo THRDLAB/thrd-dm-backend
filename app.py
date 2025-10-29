@@ -1,97 +1,29 @@
 # app.py — DM Backend (scan DataMatrix + lookup CIP13)
-# - Safe-boot: /, /docs, /health up même si les libs d'imagerie manquent
-# - Index médicaments construit en arrière-plan (non bloquant)
+# - Safe-boot : /, /docs, /health dispo même sans libs d’imagerie
+# - Index médicaments persistant (cache disque) + build en arrière-plan
+# - Refresh de l’index piloté par variable d’env (INDEX_REFRESH_HOURS)
 # - Endpoints: /decode/file, /decode/url, /lookup/cip/{cip13}, /lookup/from-dm
+# - Admin/Diag: /admin/rebuild-index, /admin/rebuild-index-throttled, /net/ping, /net/meds-page
 
+from __future__ import annotations
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os, threading, time as _time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
-# ---- Lookup (stdlib only) ----
+# ==== Lookup / Index manager (stdlib only) ====
 from resolver import (
     parse_datamatrix_to_cip13,
     extract_conditionnement,
     extract_dosage_from_compo,
     fallback_dosage_from_text,
 )
-from index_builder import CipIndexManager
+from index_builder import CipIndexManager, build_cip_index_from_api, save_index_to_disk, merge_indexes
 
-app = FastAPI(title="DM Backend", version="1.0.0")
+app = FastAPI(title="DM Backend", version="1.1.0")
 
-# === DIAG EGRESS ===
-import socket, json
-from urllib.request import Request, urlopen
-
-def _fetch_json(url: str, timeout: int = 10):
-    req = Request(url, headers={"User-Agent": "egress-check/1.0", "Accept": "application/json"})
-    with urlopen(req, timeout=timeout) as r:
-        body = r.read().decode("utf-8", errors="ignore")
-        ctype = r.headers.get("Content-Type", "")
-        # si ce n'est pas du JSON strict, on renvoie le texte brut
-        try:
-            return r.status, ctype, json.loads(body)
-        except Exception:
-            return r.status, ctype, body
-
-@app.get("/net/ping")
-def net_ping():
-    """
-    Vérifie DNS + IP sortante + accès HTTPS générique.
-    """
-    out = {}
-    try:
-        out["dns_medicaments_api"] = socket.gethostbyname("medicaments-api.giygas.dev")
-    except Exception as e:
-        out["dns_medicaments_api_error"] = str(e)
-
-    # IP egress (plusieurs services possibles ; on en essaie 2)
-    for name, url in [
-        ("ifconfig", "https://ifconfig.me/ip"),
-        ("ipify", "https://api.ipify.org?format=json"),
-    ]:
-        try:
-            status, ctype, data = _fetch_json(url, timeout=8)
-            out[f"egress_{name}_status"] = status
-            out[f"egress_{name}_data"] = data
-        except Exception as e:
-            out[f"egress_{name}_error"] = str(e)
-
-    return {"ok": True, "env_http_proxy": os.getenv("HTTP_PROXY"), "env_https_proxy": os.getenv("HTTPS_PROXY"), "diag": out}
-
-@app.get("/net/meds-page")
-def net_meds_page(page: int = 1):
-    """
-    Tente d'appeler l'API médicaments depuis le container.
-    """
-    url = f"{API_BASE_URL.rstrip('/')}/database/{page}"
-    try:
-        status, ctype, data = _fetch_json(url, timeout=12)
-        return {"ok": True, "url": url, "status": status, "content_type": ctype, "sample": (data if isinstance(data, dict) else str(data)[:400])}
-    except Exception as e:
-        return JSONResponse(status_code=502, content={"ok": False, "url": url, "error": str(e)})
-
-@app.get("/admin/rebuild-index-once")
-def admin_rebuild_index_once():
-    """
-    Lance un build synchrone (une passe) pour debug : télécharge 1 page, indexe, sauvegarde disque.
-    Permet de voir immédiatement une erreur egress/logs si ça échoue.
-    """
-    try:
-        from index_builder import build_cip_index_from_api, save_index_to_disk
-        tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=1)
-        size = len(tmp)
-        if size > 0 and CIP_INDEX_CACHE_PATH:
-            save_index_to_disk(tmp, CIP_INDEX_CACHE_PATH)
-            # recharge en mémoire
-            CIP_MGR.refresh(base_url=API_BASE_URL, progress=None)
-        return {"ok": True, "indexed": size, "cache_path": CIP_INDEX_CACHE_PATH}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-
-# ---- CORS pour Bubble (ajuste si besoin) ----
+# ==== CORS (ajuste si besoin) ====
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -101,60 +33,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Config lookup/index ----
+# ==== Config ====
 API_BASE_URL = os.getenv("API_BASE_URL", "https://medicaments-api.giygas.dev")
 CIP_INDEX_CACHE_PATH = os.getenv("CIP_INDEX_CACHE_PATH", "cip_index.json")
-INDEX_REFRESH_HOURS = int(os.getenv("INDEX_REFRESH_HOURS", "24"))
+INDEX_REFRESH_HOURS = int(os.getenv("INDEX_REFRESH_HOURS", "24"))  # fréquence de refresh
 
+# Index en mémoire + cache disque
 CIP_MGR = CipIndexManager(cache_path=CIP_INDEX_CACHE_PATH)
-INDEX_READY = False  # indicateur simple
-_INDEX_LOCK = threading.Lock()
-
-
-def _ensure_index_ready():
-    """Garantit que l'index est chargé avant de répondre aux lookups."""
-    global INDEX_READY
-    if INDEX_READY and CIP_MGR.size > 0:
-        return
-
-    with _INDEX_LOCK:
-        if INDEX_READY and CIP_MGR.size > 0:
-            return
-        try:
-            CIP_MGR.warm_start_or_build(base_url=API_BASE_URL)
-        except Exception:
-            # on laisse le thread de fond réessayer; les endpoints remonteront 503
-            pass
-        finally:
-            INDEX_READY = (CIP_MGR.size > 0)
+INDEX_READY = False  # flag simple pour l'état de l'index
 
 def _build_index_job():
-    """Construit/charge l'index en arrière-plan (boot non bloquant)."""
+    """Construit/charge l'index au boot puis le refresh périodiquement, en arrière-plan."""
     global INDEX_READY
     try:
-        # Warm-start depuis disque si possible, sinon build complet depuis l'API
-        with _INDEX_LOCK:
-            CIP_MGR.warm_start_or_build(base_url=API_BASE_URL)
-            INDEX_READY = (CIP_MGR.size > 0)
-        # Refresh périodique
+        print(f"[INDEX] warm_start_or_build from {API_BASE_URL}", flush=True)
+        CIP_MGR.warm_start_or_build(base_url=API_BASE_URL)
+        INDEX_READY = (CIP_MGR.size > 0)
+        print(f"[INDEX] ready={INDEX_READY} size={CIP_MGR.size}", flush=True)
+
         while True:
-            _time.sleep(INDEX_REFRESH_HOURS * 3600)
+            _time.sleep(max(1, INDEX_REFRESH_HOURS) * 3600)
             try:
-                with _INDEX_LOCK:
-                    CIP_MGR.refresh(base_url=API_BASE_URL)
+                print("[INDEX] periodic refresh…", flush=True)
+                CIP_MGR.refresh(base_url=API_BASE_URL)
             finally:
                 INDEX_READY = (CIP_MGR.size > 0)
-    except Exception:
+                print(f"[INDEX] after refresh size={CIP_MGR.size}", flush=True)
+    except Exception as e:
+        print(f"[INDEX] background job error: {e}", flush=True)
         INDEX_READY = (CIP_MGR.size > 0)
 
 @app.on_event("startup")
 def _start_background_jobs():
-    # Démarrage instantané; l'index se construit en tâche de fond
+    # Build en arrière-plan pour démarrage instantané
     if os.getenv("SKIP_INDEX_BUILD", "0") != "1":
         t = threading.Thread(target=_build_index_job, daemon=True)
         t.start()
 
-# ---- Endpoints de base ----
+# ==== Endpoints de base ====
 
 @app.get("/")
 def root():
@@ -166,12 +82,77 @@ def health():
 
 @app.get("/admin/rebuild-index")
 def admin_rebuild_index():
-    """Relance un build asynchrone de l'index (utile si SKIP_INDEX_BUILD=1)."""
+    """Relance le job de build/refresh en arrière-plan (non bloquant)."""
     t = threading.Thread(target=_build_index_job, daemon=True)
     t.start()
-    return {"ok": True, "msg": "Index rebuild triggered in background."}
+    return {"ok": True, "msg": "Background index (re)build triggered."}
 
-# ---- Imports lazy pour la partie imagerie (ne bloquent pas le boot) ----
+@app.get("/admin/rebuild-index-throttled")
+def admin_rebuild_index_throttled():
+    """
+    Build par tranches avec throttle/backoff (utilise index_builder.py).
+    Fusionne avec l'index existant, écrit le cache, recharge en mémoire.
+    À appeler plusieurs fois (ou via cron) jusqu'à ce que la taille n'augmente plus.
+    """
+    tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=None)
+    added = len(tmp)
+    if added == 0:
+        return {"ok": True, "indexed": 0, "index_size": CIP_MGR.size, "note": "no new pages (or rate-limited)"}
+
+    existing = []
+    if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
+        try:
+            import json
+            with open(CIP_INDEX_CACHE_PATH, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = CIP_MGR._index or []
+
+    merged = merge_indexes(existing, tmp)
+    save_index_to_disk(merged, CIP_INDEX_CACHE_PATH)
+    CIP_MGR._index = merged
+    return {"ok": True, "indexed": added, "index_size": len(merged), "cache_path": CIP_INDEX_CACHE_PATH}
+
+# ==== Diag egress utiles (optionnels, mais pratiques) ====
+import socket, json
+from urllib.request import Request, urlopen
+
+def _fetch_json(url: str, timeout: int = 10):
+    req = Request(url, headers={"User-Agent": "egress-check/1.0", "Accept": "application/json"})
+    with urlopen(req, timeout=timeout) as r:
+        body = r.read().decode("utf-8", errors="ignore")
+        ctype = r.headers.get("Content-Type", "")
+        try:
+            return r.status, ctype, json.loads(body)
+        except Exception:
+            return r.status, ctype, body
+
+@app.get("/net/ping")
+def net_ping():
+    out = {}
+    try:
+        out["dns_medicaments_api"] = socket.gethostbyname("medicaments-api.giygas.dev")
+    except Exception as e:
+        out["dns_medicaments_api_error"] = str(e)
+    for name, url in [("ifconfig", "https://ifconfig.me/ip"), ("ipify", "https://api.ipify.org?format=json")]:
+        try:
+            status, ctype, data = _fetch_json(url, timeout=8)
+            out[f"egress_{name}_status"] = status
+            out[f"egress_{name}_data"] = data
+        except Exception as e:
+            out[f"egress_{name}_error"] = str(e)
+    return {"ok": True, "env_http_proxy": os.getenv("HTTP_PROXY"), "env_https_proxy": os.getenv("HTTPS_PROXY"), "diag": out}
+
+@app.get("/net/meds-page")
+def net_meds_page(page: int = 1):
+    url = f"{API_BASE_URL.rstrip('/')}/database/{page}"
+    try:
+        status, ctype, data = _fetch_json(url, timeout=12)
+        return {"ok": True, "url": url, "status": status, "content_type": ctype, "sample": (data if isinstance(data, dict) else str(data)[:400])}
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"ok": False, "url": url, "error": str(e)})
+
+# ==== Lazy imports (scan) : ne bloquent pas le boot ====
 
 def _lazy_imports() -> Dict[str, Any]:
     try:
@@ -182,32 +163,19 @@ def _lazy_imports() -> Dict[str, Any]:
         import time
         import urllib.request as urlreq
     except Exception as e:
-        # Indique proprement que le scan n'est pas dispo (libs manquantes)
         raise HTTPException(status_code=501, detail=f"Scan not available: missing libs: {e}")
-
-    # OpenCV facultatif
     try:
         import cv2  # type: ignore
         OPENCV_AVAILABLE = True
     except Exception:
         cv2 = None  # type: ignore
         OPENCV_AVAILABLE = False
-
     return {
-        "BytesIO": BytesIO,
-        "np": np,
-        "Image": Image,
-        "ImageOps": ImageOps,
-        "ImageFilter": ImageFilter,
-        "dm_decode": dm_decode,
-        "time": time,
-        "urlreq": urlreq,
-        "cv2": cv2,
-        "OPENCV_AVAILABLE": OPENCV_AVAILABLE,
-        "os": os,
+        "BytesIO": BytesIO, "np": np,
+        "Image": Image, "ImageOps": ImageOps, "ImageFilter": ImageFilter,
+        "dm_decode": dm_decode, "time": time, "urlreq": urlreq,
+        "cv2": cv2, "OPENCV_AVAILABLE": OPENCV_AVAILABLE, "os": os,
     }
-
-# ---- Réglages scan (via env) ----
 
 def _get_settings(env: Dict[str, Any]) -> Dict[str, Any]:
     MAX_UPLOAD_MB = float(env["os"].getenv("MAX_UPLOAD_MB", "8"))
@@ -221,7 +189,7 @@ def _get_settings(env: Dict[str, Any]) -> Dict[str, Any]:
         "TRY_THRESHOLDS": (None, 20),
     }
 
-# ---- Outils image ----
+# ==== Outils image (identiques à ta version safe) ====
 
 def _resize_cap(Image, im, max_side=1600):
     w, h = im.size
@@ -236,7 +204,6 @@ def _try_variants(env: Dict[str, Any], im, attempts: list, label_prefix: str, t0
     TIME_BUDGET_MS, ATTEMPT_TIMEOUT_MS, SHRINKS, TRY_THRESHOLDS = (
         settings["TIME_BUDGET_MS"], settings["ATTEMPT_TIMEOUT_MS"], settings["SHRINKS"], settings["TRY_THRESHOLDS"]
     )
-
     gray = ImageOps.grayscale(im)
     gray_ac = ImageOps.autocontrast(gray)
     inv = ImageOps.invert(gray_ac)
@@ -244,9 +211,7 @@ def _try_variants(env: Dict[str, Any], im, attempts: list, label_prefix: str, t0
     sharp = ImageOps.autocontrast(env["Image"].fromarray(np.array(gray_ac))).filter(
         ImageFilter.UnsharpMask(radius=1.5, percent=100, threshold=2)
     )
-
     variants = [("rgb", im), ("gray", gray_ac), ("inv", inv), ("bw", bw), ("sharp", sharp)]
-
     for vname, vimg in variants:
         for angle in (0, 90, 180, 270):
             if (env["time"].perf_counter() - t0) * 1000 > TIME_BUDGET_MS:
@@ -290,7 +255,7 @@ def _auto_crop_dm(env: Dict[str, Any], im):
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
-        if area < (W * H * 0.01):  # ignore trop petit
+        if area < (W * H * 0.01):
             continue
         ar = w / float(h)
         squareness = 1.0 - abs(1.0 - ar)
@@ -311,17 +276,15 @@ def _auto_crop_dm(env: Dict[str, Any], im):
     crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
     return crop_pil
 
-# ---- Endpoints scan ----
+# ==== Endpoints scan ====
 
 @app.post("/decode/file")
 async def decode_file(file: UploadFile = File(...)):
     env = _lazy_imports()
     settings = _get_settings(env)
     BytesIO = env["BytesIO"]; Image = env["Image"]; ImageOps = env["ImageOps"]
-
     t0 = env["time"].perf_counter()
     try:
-        # lecture streamée + limite de taille
         buf = BytesIO()
         total = 0
         while True:
@@ -335,20 +298,16 @@ async def decode_file(file: UploadFile = File(...)):
         raw = buf.getvalue()
         if not raw:
             raise HTTPException(status_code=400, detail="Empty upload")
-
-        # ouverture image
         try:
             img = Image.open(BytesIO(raw)).convert("RGB")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
         img = ImageOps.exif_transpose(img)
         img = _resize_cap(Image, img, settings["MAX_SIDE_PX"])
-
         attempts = []
         out = _try_variants(env, img, attempts, "full", t0, settings)
         if out["codes"]:
             return {"ok": True, "found": len(out["codes"]), "codes": out["codes"], "debug": {"attempts": attempts}}
-
         for scale in (0.75, 0.6, 0.5, 0.4, 0.33):
             if (env["time"].perf_counter() - t0) * 1000 > settings["TIME_BUDGET_MS"]:
                 break
@@ -357,7 +316,6 @@ async def decode_file(file: UploadFile = File(...)):
             out = _try_variants(env, ds, attempts, f"down{scale}", t0, settings)
             if out["codes"]:
                 return {"ok": True, "found": len(out["codes"]), "codes": out["codes"], "debug": {"attempts": attempts}}
-
         try:
             roi = _auto_crop_dm(env, img)
         except Exception:
@@ -366,9 +324,7 @@ async def decode_file(file: UploadFile = File(...)):
             out = _try_variants(env, roi, attempts, "roi", t0, settings)
             if out["codes"]:
                 return {"ok": True, "found": len(out["codes"]), "codes": out["codes"], "debug": {"attempts": attempts}}
-
         return {"ok": True, "found": 0, "codes": [], "debug": {"attempts": attempts}}
-
     except HTTPException:
         raise
     except Exception as e:
@@ -376,33 +332,26 @@ async def decode_file(file: UploadFile = File(...)):
 
 @app.get("/decode/url")
 def decode_url(url: str = Query(..., description="URL publique d'une image (jpg/png)")):
-    # Alternative GET (utile si multipart pose souci derrière un proxy)
     env = _lazy_imports()
     settings = _get_settings(env)
     BytesIO = env["BytesIO"]; Image = env["Image"]; ImageOps = env["ImageOps"]; urlreq = env["urlreq"]
-
-    # téléchargement
     try:
         req = urlreq.Request(url, headers={"User-Agent": "dm-backend/1.0"})
         with urlreq.urlopen(req, timeout=10) as r:
             raw = r.read()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Impossible de télécharger l'image: {e}")
-
     try:
         img = Image.open(BytesIO(raw)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
-
     img = ImageOps.exif_transpose(img)
     img = _resize_cap(Image, img, settings["MAX_SIDE_PX"])
-
     t0 = env["time"].perf_counter()
     attempts = []
     out = _try_variants(env, img, attempts, "url_full", t0, settings)
     if out["codes"]:
         return {"ok": True, "found": len(out["codes"]), "codes": out["codes"], "debug": {"attempts": attempts}}
-
     for scale in (0.75, 0.6, 0.5, 0.4, 0.33):
         if (env["time"].perf_counter() - t0) * 1000 > settings["TIME_BUDGET_MS"]:
             break
@@ -411,7 +360,6 @@ def decode_url(url: str = Query(..., description="URL publique d'une image (jpg/
         out = _try_variants(env, ds, attempts, f"url_down{scale}", t0, settings)
         if out["codes"]:
             return {"ok": True, "found": len(out["codes"]), "codes": out["codes"], "debug": {"attempts": attempts}}
-
     try:
         roi = _auto_crop_dm(env, img)
     except Exception:
@@ -420,15 +368,12 @@ def decode_url(url: str = Query(..., description="URL publique d'une image (jpg/
         out = _try_variants(env, roi, attempts, "url_roi", t0, settings)
         if out["codes"]:
             return {"ok": True, "found": len(out["codes"]), "codes": out["codes"], "debug": {"attempts": attempts}}
-
     return {"ok": True, "found": 0, "codes": [], "debug": {"attempts": attempts}}
 
-# ---- Endpoints lookup ----
+# ==== Endpoints lookup (utilisent l’index local persistant) ====
 
 @app.get("/lookup/cip/{cip13}")
 def lookup_cip(cip13: str):
-    if not INDEX_READY or CIP_MGR.size == 0:
-        _ensure_index_ready()
     if not INDEX_READY or CIP_MGR.size == 0:
         raise HTTPException(status_code=503, detail="INDEX_NOT_READY")
     item = CIP_MGR.get(cip13)
@@ -449,12 +394,8 @@ def lookup_cip(cip13: str):
 @app.get("/lookup/from-dm")
 def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMatrix)")):
     if not INDEX_READY or CIP_MGR.size == 0:
-        _ensure_index_ready()
-    if not INDEX_READY or CIP_MGR.size == 0:
         raise HTTPException(status_code=503, detail="INDEX_NOT_READY")
     cip13 = parse_datamatrix_to_cip13(gs1)
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
-
-
