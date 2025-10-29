@@ -22,7 +22,7 @@ def health():
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "8"))
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
 MAX_SIDE_PX = int(os.getenv("MAX_SIDE_PX", "1600"))      # cap résolution pour CPU
-TIME_BUDGET_MS = int(os.getenv("TIME_BUDGET_MS", "20000"))  # budget temps par requête
+TIME_BUDGET_MS = int(os.getenv("TIME_BUDGET_MS", "40000"))  # budget temps par requête
 
 def _resize_cap(im: Image.Image, max_side=1600) -> Image.Image:
     w, h = im.size
@@ -192,4 +192,5 @@ async def decode_file(file: UploadFile = File(...)):
     except Exception as e:
         # Ne pas laisser crasher le worker → 500 JSON propre
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
 
