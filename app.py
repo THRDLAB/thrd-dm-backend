@@ -22,7 +22,11 @@ def health():
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "8"))
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
 MAX_SIDE_PX = int(os.getenv("MAX_SIDE_PX", "1600"))      # cap résolution pour CPU
-TIME_BUDGET_MS = int(os.getenv("TIME_BUDGET_MS", "40000"))  # budget temps par requête
+TIME_BUDGET_MS = int(os.getenv("TIME_BUDGET_MS", "20000"))  # budget temps par requête
+ATTEMPT_TIMEOUT_MS = int(os.getenv("ATTEMPT_TIMEOUT_MS", "800"))  # max par appel pylibdmtx
+SHRINKS = tuple(int(x) for x in os.getenv("SHRINKS", "3,2,1").split(","))  # du plus rapide au plus précis
+TRY_THRESHOLDS = (None, 20)  # None = défaut pylibdmtx, puis un seuil un peu plus agressif
+
 
 def _resize_cap(im: Image.Image, max_side=1600) -> Image.Image:
     w, h = im.size
@@ -32,8 +36,8 @@ def _resize_cap(im: Image.Image, max_side=1600) -> Image.Image:
     r = max_side / m
     return im.resize((int(w*r), int(h*r)), Image.LANCZOS)
 
-def _decode_once(im: Image.Image):
-    res = dm_decode(im)
+def _decode_once(im: Image.Image, timeout_ms=800, shrink=2, max_count=1):
+    res = dm_decode(im, timeout=timeout_ms, max_count=max_count, shrink=shrink)
     out = []
     for r in res or []:
         out.append({
@@ -43,7 +47,8 @@ def _decode_once(im: Image.Image):
     return out
 
 def _try_variants(im: Image.Image, attempts: list, label_prefix: str, t0: float):
-    """Essais rapides: couleur/gris/invert/binaire/sharp + rotations."""
+    """Essais rapides: couleur/gris/invert/binaire/sharp + rotations,
+    avec timebox (timeout) + shrink progressif (3→2→1) par tentative."""
     gray = ImageOps.grayscale(im)
     gray_ac = ImageOps.autocontrast(gray)
     inv = ImageOps.invert(gray_ac)
@@ -51,28 +56,57 @@ def _try_variants(im: Image.Image, attempts: list, label_prefix: str, t0: float)
     bw = gray_ac.point(lambda p: 0 if p < 128 else 255, mode='1').convert("L")
     # Lissage léger puis autocontrast pour nettoyer le grain
     sharp = ImageOps.autocontrast(
-        Image.fromarray(np.array(gray_ac))  # PIL → np
+        Image.fromarray(np.array(gray_ac))
     ).filter(ImageFilter.UnsharpMask(radius=1.5, percent=100, threshold=2))
 
-    for vname, vimg in [
+    # ordre des variantes
+    variants = [
         ("rgb", im),
         ("gray", gray_ac),
         ("inv", inv),
         ("bw", bw),
         ("sharp", sharp),
-    ]:
+    ]
+
+    for vname, vimg in variants:
         for angle in (0, 90, 180, 270):
             if (time.perf_counter() - t0) * 1000 > TIME_BUDGET_MS:
                 break
             rot = vimg if angle == 0 else vimg.rotate(angle, expand=True)
-            out = _decode_once(rot)
-            attempts.append({"step": f"{label_prefix}_{vname}_rot{angle}",
-                             "found": len(out), "size": rot.size})
-            if out:
-                for o in out:
-                    o["pretty"] = o["text"].replace("\x1D", "|")
-                return {"ok": True, "codes": out}
+
+            # boucle shrink (3→2→1) avec timeout borné par essai
+            for sh in SHRINKS:
+                # pour les variantes non N&B, on garde threshold par défaut, puis 20
+                thresholds = TRY_THRESHOLDS if vname in ("gray", "inv", "bw") else (None,)
+                for thr in thresholds:
+                    if (time.perf_counter() - t0) * 1000 > TIME_BUDGET_MS:
+                        break
+
+                    # appel pylibdmtx "timeboxé" et échantillonné
+                    if thr is None:
+                        res = dm_decode(rot, timeout=ATTEMPT_TIMEOUT_MS, max_count=1, shrink=sh)
+                        step = f"{label_prefix}_{vname}_rot{angle}_sh{sh}"
+                    else:
+                        res = dm_decode(rot, timeout=ATTEMPT_TIMEOUT_MS, max_count=1, shrink=sh, threshold=thr)
+                        step = f"{label_prefix}_{vname}_rot{angle}_sh{sh}_th{thr}"
+
+                    out = []
+                    for r in res or []:
+                        out.append({
+                            "text": r.data.decode("utf-8", errors="ignore"),
+                            "rect": getattr(r, "rect", None)
+                        })
+
+                    attempts.append({"step": step, "found": len(out), "size": rot.size})
+
+                    if out:
+                        # pretty: rendre FNC1 visible
+                        for o in out:
+                            o["pretty"] = o["text"].replace("\x1D", "|")
+                        return {"ok": True, "codes": out}
+
     return {"ok": True, "codes": []}
+
 
 def _auto_crop_dm(im: Image.Image):
     """
@@ -192,5 +226,6 @@ async def decode_file(file: UploadFile = File(...)):
     except Exception as e:
         # Ne pas laisser crasher le worker → 500 JSON propre
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
 
 
