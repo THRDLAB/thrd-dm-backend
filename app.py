@@ -102,11 +102,11 @@ def admin_rebuild_index_throttled(
         # tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=None, pages_per_run=pages)
         tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=None)
 
-        added = len(tmp)
-        if added == 0:
-            return {"ok": True, "indexed": 0, "index_size": CIP_MGR.size, "note": "no new pages (or rate-limited)"}
+added = len(tmp)
+if added == 0:
+    return {"ok": True, "indexed": 0, "index_size": CIP_MGR.size, "note": "no new pages (or rate-limited)"}
 
-       existing = []
+existing = []
 if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
     try:
         import json as json
@@ -443,6 +443,7 @@ def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMat
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
+
 
 
 
