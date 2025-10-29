@@ -96,31 +96,34 @@ def admin_rebuild_index_throttled(
     pages: int = Query(5, ge=1, le=500, description="Nombre de pages BDPM à traiter dans CET appel")
 ):
     try:
-        # (si tu n’as PAS modifié index_builder pour accepter pages_per_run,
-        # on ne passe rien ici : il lira INDEX_PAGES_PER_RUN depuis l'env)
-        # Si tu l’as modifié, dé-commente cette ligne et commente la suivante :
-        # tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=None, pages_per_run=pages)
+        # Si tu n’as PAS modifié index_builder pour accepter pages_per_run,
+        # on ne passe rien ici : il lira INDEX_PAGES_PER_RUN depuis l'env
         tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=None)
 
-added = len(tmp)
-if added == 0:
-    return {"ok": True, "indexed": 0, "index_size": CIP_MGR.size, "note": "no new pages (or rate-limited)"}
+        added = len(tmp)
+        if added == 0:
+            return {"ok": True, "indexed": 0, "index_size": CIP_MGR.size,
+                    "note": "no new pages (or rate-limited)"}
 
-existing = []
-if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
-    try:
-        import json as json
-        with open(CIP_INDEX_CACHE_PATH, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        # On ne garde que les dicts avec cip13
-        if isinstance(raw, list):
-            existing = [x for x in raw if isinstance(x, dict) and "cip13" in x]
-        elif isinstance(raw, dict) and "cip13" in raw:
-            existing = [raw]
-        else:
-            existing = []
-    except Exception:
         existing = []
+        if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
+            try:
+                with open(CIP_INDEX_CACHE_PATH, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, list):
+                    existing = [x for x in raw if isinstance(x, dict) and "cip13" in x]
+                elif isinstance(raw, dict) and "cip13" in raw:
+                    existing = [raw]
+            except Exception:
+                existing = []
+
+        merged = merge_indexes(existing, tmp)
+        save_index_to_disk(merged, CIP_INDEX_CACHE_PATH)
+        CIP_MGR._index = merged
+        return {"ok": True, "indexed": added, "index_size": CIP_MGR.size}
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
         
 # ==== Diag egress ====
@@ -443,6 +446,7 @@ def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMat
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
+
 
 
 
