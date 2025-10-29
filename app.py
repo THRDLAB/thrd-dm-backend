@@ -8,6 +8,10 @@ from pylibdmtx.pylibdmtx import decode as dm_decode
 
 app = FastAPI()
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 def _decode_once(img: Image.Image):
     """Retourne liste de dicts {text, rect} via pylibdmtx."""
     res = dm_decode(img)
@@ -178,3 +182,4 @@ async def decode_file(file: UploadFile = File(...)):
         },
         "hint": hint
     }
+
