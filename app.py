@@ -33,6 +33,7 @@ app.add_middleware(
 # ---- Config lookup/index ----
 API_BASE_URL = os.getenv("API_BASE_URL", "https://medicaments-api.giygas.dev")
 CIP_INDEX_CACHE_PATH = os.getenv("CIP_INDEX_CACHE_PATH", "cip_index.json")
+INDEX_REFRESH_HOURS = int(os.getenv("INDEX_REFRESH_HOURS", "24"))
 
 CIP_MGR = CipIndexManager(cache_path=CIP_INDEX_CACHE_PATH)
 INDEX_READY = False  # indicateur simple
@@ -66,7 +67,7 @@ def _build_index_job():
             INDEX_READY = (CIP_MGR.size > 0)
         # Refresh périodique
         while True:
-            _time.sleep(12 * 3600)  # toutes les 12 h
+            _time.sleep(INDEX_REFRESH_HOURS * 3600)
             try:
                 with _INDEX_LOCK:
                     CIP_MGR.refresh(base_url=API_BASE_URL)
@@ -384,3 +385,4 @@ def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMat
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
+
