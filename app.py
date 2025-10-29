@@ -20,6 +20,77 @@ from index_builder import CipIndexManager
 
 app = FastAPI(title="DM Backend", version="1.0.0")
 
+# === DIAG EGRESS ===
+import socket, json
+from urllib.request import Request, urlopen
+
+def _fetch_json(url: str, timeout: int = 10):
+    req = Request(url, headers={"User-Agent": "egress-check/1.0", "Accept": "application/json"})
+    with urlopen(req, timeout=timeout) as r:
+        body = r.read().decode("utf-8", errors="ignore")
+        ctype = r.headers.get("Content-Type", "")
+        # si ce n'est pas du JSON strict, on renvoie le texte brut
+        try:
+            return r.status, ctype, json.loads(body)
+        except Exception:
+            return r.status, ctype, body
+
+@app.get("/net/ping")
+def net_ping():
+    """
+    Vérifie DNS + IP sortante + accès HTTPS générique.
+    """
+    out = {}
+    try:
+        out["dns_medicaments_api"] = socket.gethostbyname("medicaments-api.giygas.dev")
+    except Exception as e:
+        out["dns_medicaments_api_error"] = str(e)
+
+    # IP egress (plusieurs services possibles ; on en essaie 2)
+    for name, url in [
+        ("ifconfig", "https://ifconfig.me/ip"),
+        ("ipify", "https://api.ipify.org?format=json"),
+    ]:
+        try:
+            status, ctype, data = _fetch_json(url, timeout=8)
+            out[f"egress_{name}_status"] = status
+            out[f"egress_{name}_data"] = data
+        except Exception as e:
+            out[f"egress_{name}_error"] = str(e)
+
+    return {"ok": True, "env_http_proxy": os.getenv("HTTP_PROXY"), "env_https_proxy": os.getenv("HTTPS_PROXY"), "diag": out}
+
+@app.get("/net/meds-page")
+def net_meds_page(page: int = 1):
+    """
+    Tente d'appeler l'API médicaments depuis le container.
+    """
+    url = f"{API_BASE_URL.rstrip('/')}/database/{page}"
+    try:
+        status, ctype, data = _fetch_json(url, timeout=12)
+        return {"ok": True, "url": url, "status": status, "content_type": ctype, "sample": (data if isinstance(data, dict) else str(data)[:400])}
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"ok": False, "url": url, "error": str(e)})
+
+@app.get("/admin/rebuild-index-once")
+def admin_rebuild_index_once():
+    """
+    Lance un build synchrone (une passe) pour debug : télécharge 1 page, indexe, sauvegarde disque.
+    Permet de voir immédiatement une erreur egress/logs si ça échoue.
+    """
+    try:
+        from index_builder import build_cip_index_from_api, save_index_to_disk
+        tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=1)
+        size = len(tmp)
+        if size > 0 and CIP_INDEX_CACHE_PATH:
+            save_index_to_disk(tmp, CIP_INDEX_CACHE_PATH)
+            # recharge en mémoire
+            CIP_MGR.refresh(base_url=API_BASE_URL, progress=None)
+        return {"ok": True, "indexed": size, "cache_path": CIP_INDEX_CACHE_PATH}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
 # ---- CORS pour Bubble (ajuste si besoin) ----
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
 app.add_middleware(
@@ -385,4 +456,5 @@ def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMat
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
+
 
