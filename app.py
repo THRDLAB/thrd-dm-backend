@@ -102,9 +102,10 @@ def _auto_crop_dm(im: Image.Image):
         score = squareness * 0.6 + min(texture/5000.0, 1.0) * 0.4
         if score > best_score:
             best_score, best = (score, (x,y,w,h))
-    if not best:
+        if not best:
         return None
-    x,y,w,h = best[1]
+-   x,y,w,h = best[1]
++   x, y, w, h = best
     pad = int(max(w,h)*0.15)
     x0 = max(0, x-pad); y0 = max(0, y-pad)
     x1 = min(W, x+w+pad); y1 = min(H, y+h+pad)
@@ -165,3 +166,4 @@ async def decode_file(file: UploadFile = File(...)):
         raise
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
