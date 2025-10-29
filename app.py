@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os, threading, time as _time
 import json
 from typing import Any, Dict
+from fastapi import Query
 
 # ==== Lookup / Index manager (stdlib only) ====
 from resolver import (
@@ -88,13 +89,20 @@ def admin_rebuild_index():
     t.start()
     return {"ok": True, "msg": "Background index (re)build triggered."}
 
+from fastapi import Query
+
 @app.get("/admin/rebuild-index-throttled")
-def admin_rebuild_index_throttled():
+def admin_rebuild_index_throttled(
+    pages: int = Query(5, ge=1, le=500, description="Nombre de pages BDPM à traiter dans CET appel")
+):
     """
-    Build par tranches avec throttle/backoff (utilise index_builder.py).
-    Fusionne avec l'index existant, écrit le cache, recharge en mémoire.
-    À appeler plusieurs fois (ou via cron) jusqu'à ce que la taille n'augmente plus.
+    Construit l'index par tranches rapides.
+    - `pages`: nb de pages BDPM à traiter pour cet appel (1–500).
     """
+    from index_builder import build_cip_index_from_api, save_index_to_disk, merge_indexes
+    # override temporaire pour CET appel
+    os.environ["INDEX_PAGES_PER_RUN"] = str(pages)
+
     tmp = build_cip_index_from_api(base_url=API_BASE_URL, max_pages=None)
     added = len(tmp)
     if added == 0:
@@ -103,9 +111,9 @@ def admin_rebuild_index_throttled():
     existing = []
     if CIP_INDEX_CACHE_PATH and os.path.exists(CIP_INDEX_CACHE_PATH):
         try:
-            import json
+            import json as _json
             with open(CIP_INDEX_CACHE_PATH, "r", encoding="utf-8") as f:
-                existing = json.load(f)
+                existing = _json.load(f)
         except Exception:
             existing = CIP_MGR._index or []
 
@@ -423,6 +431,7 @@ def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMat
     if not cip13:
         raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
     return lookup_cip(cip13)
+
 
 
 
