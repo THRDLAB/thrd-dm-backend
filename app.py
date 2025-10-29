@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse
 from io import BytesIO
 from PIL import Image, ImageOps, ImageFilter
@@ -12,21 +12,60 @@ try:
 except Exception:
     OPENCV_AVAILABLE = False
 
+# --- Imports ajoutés pour l'étape 2 (lookup CIP13 -> infos médicament)
+from resolver import (
+    parse_datamatrix_to_cip13,
+    extract_conditionnement,
+    extract_dosage_from_compo,
+    fallback_dosage_from_text,
+)
+from index_builder import CipIndexManager
+
 app = FastAPI()
+
+# ----------------------------
+# Santé / état de l'index
+# ----------------------------
+
+# Config via variables d'env
+API_BASE_URL = os.getenv("API_BASE_URL", "https://medicaments-api.giygas.dev")
+CIP_INDEX_CACHE_PATH = os.getenv("CIP_INDEX_CACHE_PATH", "cip_index.json")
+
+CIP_MGR = CipIndexManager(cache_path=CIP_INDEX_CACHE_PATH)
+
+@app.on_event("startup")
+def on_startup():
+    """
+    Au boot :
+    - tente un warm-start depuis cip_index.json si présent
+    - sinon construit l'index local depuis l'API (pagination /database/{page})
+    """
+    CIP_MGR.warm_start_or_build(base_url=API_BASE_URL)
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "index_size": CIP_MGR.size,
+        "last_refresh_ts": CIP_MGR.last_refresh_ts
+    }
+
+# ----------------------------
+# Paramètres scan image (conservés)
+# ----------------------------
 
 # Limites configurables via variables d'env (Dockerfile les définit aussi)
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "8"))
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
-MAX_SIDE_PX = int(os.getenv("MAX_SIDE_PX", "1600"))      # cap résolution pour CPU
-TIME_BUDGET_MS = int(os.getenv("TIME_BUDGET_MS", "20000"))  # budget temps par requête
+MAX_SIDE_PX = int(os.getenv("MAX_SIDE_PX", "1600"))            # cap résolution pour CPU
+TIME_BUDGET_MS = int(os.getenv("TIME_BUDGET_MS", "20000"))     # budget temps par requête
 ATTEMPT_TIMEOUT_MS = int(os.getenv("ATTEMPT_TIMEOUT_MS", "800"))  # max par appel pylibdmtx
 SHRINKS = tuple(int(x) for x in os.getenv("SHRINKS", "3,2,1").split(","))  # du plus rapide au plus précis
 TRY_THRESHOLDS = (None, 20)  # None = défaut pylibdmtx, puis un seuil un peu plus agressif
 
+# ----------------------------
+# Outils scan image (conservés)
+# ----------------------------
 
 def _resize_cap(im: Image.Image, max_side=1600) -> Image.Image:
     w, h = im.size
@@ -107,7 +146,6 @@ def _try_variants(im: Image.Image, attempts: list, label_prefix: str, t0: float)
 
     return {"ok": True, "codes": []}
 
-
 def _auto_crop_dm(im: Image.Image):
     """
     Heuristique OpenCV : trouve un gros contour quasi-carré 'à damier'
@@ -159,6 +197,10 @@ def _auto_crop_dm(im: Image.Image):
     crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
     return crop_pil
 
+# ----------------------------
+# Endpoint scan image (conservé)
+# ----------------------------
+
 @app.post("/decode/file")
 async def decode_file(file: UploadFile = File(...)):
     t0 = time.perf_counter()
@@ -191,41 +233,53 @@ async def decode_file(file: UploadFile = File(...)):
 
         # A) Image complète (variants)
         out = _try_variants(img, attempts, "full", t0)
-        if out["codes"]:
-            return {"ok": True, "found": len(out["codes"]), "codes": out["codes"],
-                    "debug": {"attempts": attempts}}
+        if out["codes"]:\n            return {\"ok\": True, \"found\": len(out[\"codes\"]), \"codes\": out[\"codes\"],\n                    \"debug\": {\"attempts\": attempts}}\n\n        # B) Downscale pyramidal (cas \"trop près\")\n        for scale in (0.75, 0.6, 0.5, 0.4, 0.33):\n            if (time.perf_counter() - t0) * 1000 > TIME_BUDGET_MS:\n                break\n            w, h = img.size\n            ds = img.resize((max(64, int(w * scale)),\n                             max(64, int(h * scale))), Image.LANCZOS)\n            out = _try_variants(ds, attempts, f\"down{scale}\", t0)\n            if out[\"codes\"]:\n                return {\"ok\": True, \"found\": len(out[\"codes\"]), \"codes\": out[\"codes\"],\n                        \"debug\": {\"attempts\": attempts}}\n\n        # C) Auto-crop ROI + variants (si OpenCV dispo)\n        try:\n            roi = _auto_crop_dm(img)\n        except Exception:\n            roi = None\n        if roi is not None and (time.perf_counter() - t0) * 1000 <= TIME_BUDGET_MS:\n            out = _try_variants(roi, attempts, \"roi\", t0)\n            if out[\"codes\"]:\n                return {\"ok\": True, \"found\": len(out[\"codes\"]), \"codes\": out[\"codes\"],\n                        \"debug\": {\"attempts\": attempts}}\n\n        # Rien trouvé dans le budget de temps\n        return {\"ok\": True, \"found\": 0, \"codes\": [], \"debug\": {\"attempts\": attempts}}\n\n    except HTTPException:\n        raise\n    except Exception as e:\n        # Ne pas laisser crasher le worker → 500 JSON propre\n        return JSONResponse(status_code=500, content={\"ok\": False, \"error\": str(e)})\n
+# ----------------------------
+# Nouveaux endpoints: lookup CIP13
+# ----------------------------
 
-        # B) Downscale pyramidal (cas "trop près")
-        for scale in (0.75, 0.6, 0.5, 0.4, 0.33):
-            if (time.perf_counter() - t0) * 1000 > TIME_BUDGET_MS:
-                break
-            w, h = img.size
-            ds = img.resize((max(64, int(w * scale)),
-                             max(64, int(h * scale))), Image.LANCZOS)
-            out = _try_variants(ds, attempts, f"down{scale}", t0)
-            if out["codes"]:
-                return {"ok": True, "found": len(out["codes"]), "codes": out["codes"],
-                        "debug": {"attempts": attempts}}
+@app.get("/lookup/cip/{cip13}")
+def lookup_cip(cip13: str):
+    """
+    Retourne les infos médicament à partir d'un CIP13.
+    Réponse:
+    {
+      "ok": true,
+      "data": {
+        "cip13": "...",
+        "nom": "...",
+        "forme": "...",
+        "dosage": "...",
+        "conditionnement": {"valeur": 30, "unite": "comprimés"},
+        "libelle": "Boîte de 30 comprimés sécables"
+      }
+    }
+    """
+    item = CIP_MGR.get(cip13)
+    if not item:
+        raise HTTPException(status_code=404, detail=f"CIP13 {cip13} introuvable.")
 
-        # C) Auto-crop ROI + variants (si OpenCV dispo)
-        try:
-            roi = _auto_crop_dm(img)
-        except Exception:
-            roi = None
-        if roi is not None and (time.perf_counter() - t0) * 1000 <= TIME_BUDGET_MS:
-            out = _try_variants(roi, attempts, "roi", t0)
-            if out["codes"]:
-                return {"ok": True, "found": len(out["codes"]), "codes": out["codes"],
-                        "debug": {"attempts": attempts}}
+    cond = extract_conditionnement(item.get("libelle"))
+    dosage = extract_dosage_from_compo(item.get("composition")) or \
+             fallback_dosage_from_text(item.get("nom"), item.get("libelle"))
 
-        # Rien trouvé dans le budget de temps
-        return {"ok": True, "found": 0, "codes": [], "debug": {"attempts": attempts}}
+    return {"ok": True, "data": {
+        "cip13": cip13,
+        "nom": item.get("nom"),
+        "forme": item.get("forme"),
+        "dosage": dosage,
+        "conditionnement": cond,
+        "libelle": item.get("libelle"),
+    }}
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Ne pas laisser crasher le worker → 500 JSON propre
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-
-
+@app.get("/lookup/from-dm")
+def lookup_from_dm(gs1: str = Query(..., description="Chaîne GS1 brute (DataMatrix)")):
+    """
+    Prend une chaîne GS1 (issue de /decode/file ou autre), extrait le CIP13 (NTIN '03400' -> '3400…'),
+    puis fait le lookup local.
+    """
+    cip13 = parse_datamatrix_to_cip13(gs1)
+    if not cip13:
+        raise HTTPException(status_code=422, detail="CIP13 non dérivable (GTIN sans préfixe 03400).")
+    # Réutilise la logique ci-dessus
+    return lookup_cip(cip13)
