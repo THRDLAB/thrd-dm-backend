@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Dépendances système pour Pillow + pylibdmtx
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libdmtx-dev \
+    libdmtx-dev libdmtx0b \
     build-essential \
     libjpeg62-turbo-dev \
     zlib1g-dev \
@@ -38,5 +38,6 @@ EXPOSE 8080
 # Healthcheck (utile pour Northflank)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=15s CMD curl -fsS http://localhost:8080/health || exit 1
 
-# Gunicorn + UvicornWorker = +robuste, prêt pour la concurrence
+# Gunicorn + UvicornWorker = +robuste
 CMD ["bash","-lc","exec gunicorn -k uvicorn.workers.UvicornWorker -w ${WORKERS:-2} --threads ${THREADS:-1} -b 0.0.0.0:${PORT:-8080} --access-logfile - --timeout 30 app:app"]
+
