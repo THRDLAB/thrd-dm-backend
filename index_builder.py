@@ -204,11 +204,15 @@ def load_index_from_disk(path: str) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def merge_indexes(existing: List[Dict[str, Any]], new_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Fusionne en écrasant par cip13 (les nouvelles données remplacent les anciennes)."""
-    base = {e["cip13"]: e for e in (existing or [])}
-    for it in new_items:
-        base[it["cip13"]] = it
+def merge_indexes(existing, new_items):
+    """Fusion robuste : ignore ce qui n'est pas un dict avec 'cip13'."""
+    base = {}
+    for e in (existing or []):
+        if isinstance(e, dict) and "cip13" in e:
+            base[e["cip13"]] = e
+    for it in (new_items or []):
+        if isinstance(it, dict) and "cip13" in it:
+            base[it["cip13"]] = it
     return list(base.values())
 
 # =========================
